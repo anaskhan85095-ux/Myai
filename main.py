@@ -1,7 +1,5 @@
 import os, re, json, time, base64, threading, requests
 from datetime import date
-from html import unescape
-from urllib.parse import unquote
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
@@ -77,19 +75,16 @@ else:
 
 BG = (.03, .045, .11, 1); SURF = (.055, .08, .17, 1); CARD = (.09, .125, .26, 1)
 BLUE = (.18, .45, 1, 1); TEXT = (.92, .94, .98, 1); MUTE = (.56, .63, .82, 1)
-URL = "https://api.anthropic.com/v1/messages"
-MODEL = "claude-sonnet-5-5"
+BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 SPEECH_LANG = "hi-IN"
 TTS_LANG = ("en", "IN")
-WEB = True   # internet search band karna ho to False kar do
+WEB = True   # internet search (Google Search) band karna ho to False kar do
 SYSTEM = ("Tum 'Namaste ToonSlee AI' ho, ek expert assistant. Jawab hamesha Roman script "
           "(English letters) mein Roman Urdu/Hindi mein do, kabhi Devanagari ya Urdu script nahi, "
           "kyunke app ka font unhe dikha nahi sakta. Agar sawal Devanagari ya Urdu script mein aaye "
-          "(voice se), to pehli line 'Aapne kaha: ...' Roman mein likho, phir jawab do. Agar "
-          "message ke saath internet search results diye hon, to unse jawab do aur source links batao. "
-          "Files aur images ko dhyan se analyze karo.")
+          "(voice se), to pehli line 'Aapne kaha: ...' Roman mein likho, phir jawab do. Latest ya "
+          "current jankari ke liye internet search use karo. Files aur images ko dhyan se analyze karo.")
 VOICE_NOTE = " Ye voice baat-cheet hai: jawab chhota rakho (2 se 4 vakya), bina list ya symbols ke."
-TOOLS = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
 IMG_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
 CHIPS = [("Code", "Mujhe ek chhota Python code likh kar samjhao."),
          ("Research", "Aaj ki sabse badi khabrein search karke batao."),
@@ -101,20 +96,20 @@ ERR = {1: "Net slow hai", 2: "Net ki dikkat", 3: "Mic ki dikkat", 4: "Server ki 
        13: "Language ka data nahi hai"}
 
 
-def web_search(q, n=5):
-    r = requests.post("https://html.duckduckgo.com/html/", data={"q": q}, timeout=15,
-                      headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"})
-    clean = lambda s: unescape(re.sub(r"<[^>]+>", "", s)).strip()
-    out = []
-    for m in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
-                         r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.S):
-        link, title, snip = m.groups()
-        if "uddg=" in link:
-            link = unquote(link.split("uddg=")[1].split("&")[0])
-        out.append("%d. %s\n%s\n%s" % (len(out) + 1, clean(title), clean(snip), link))
-        if len(out) >= n:
-            break
-    return "\n\n".join(out)
+def pick_model(key):
+    r = requests.get(BASE + "?pageSize=1000", headers={"x-goog-api-key": key}, timeout=20)
+    best, bk = "gemini-flash-latest", None
+    for m in r.json().get("models", []):
+        n = m.get("name", "").split("/")[-1]
+        if "flash" not in n or "generateContent" not in m.get("supportedGenerationMethods", []):
+            continue
+        if any(x in n for x in ("lite", "image", "tts", "live", "audio", "thinking", "robotics",
+                                "computer", "exp", "latest")):
+            continue
+        k = (0 if "preview" in n else 1, [int(x) for x in re.findall(r"\d+", n)])
+        if bk is None or k > bk:
+            best, bk = n, k
+    return best
 
 
 def gtex(top, bot, n=64):
@@ -211,7 +206,7 @@ class AI(App):
     def build(self):
         Window.clearcolor = BG
         Window.softinput_mode = "below_target"
-        self.db = {"chats": [], "cur": None, "set": {"key": "", "name": "", "speak": False}}
+        self.db = {"chats": [], "cur": None, "set": {"gkey": "", "model": "", "name": "", "speak": False}}
         self.load()
         self.pending = []; self.busy = False; self.listening = False; self.handsfree = False
         self.speak_reply = False; self.misses = 0; self.poll_n = 0; self.pend_b = None
@@ -250,7 +245,7 @@ class AI(App):
         pill.add_widget(Button(text="Mic", size_hint_x=None, width=dp(50), color=MUTE,
                                background_normal="", background_color=(0, 0, 0, 0),
                                on_press=self.start_listen))
-        pill.add_widget(CBtn(text="↑", font_size=sp(22), size_hint_x=None, width=dp(52),
+        pill.add_widget(CBtn(text=">", font_size=sp(24), size_hint_x=None, width=dp(52),
                              on_press=self.send))
         outer.add_widget(pill)
         for w in (top, self.scroll, self.fl, outer):
@@ -266,7 +261,7 @@ class AI(App):
     def on_stop(self): self.stop_all()
 
     # ---------- data ----------
-    def path(self): return os.path.join(self.user_data_dir, "data.json")
+    def path(self): return os.path.join(self.user_data_dir, "gdata.json")
 
     def load(self):
         try:
@@ -451,13 +446,13 @@ class AI(App):
 
     def open_set(self, *a):
         s = self.db["set"]
-        mv = ModalView(size_hint=(.92, .8), background="", background_color=(0, 0, 0, 0),
+        mv = ModalView(size_hint=(.92, .85), background="", background_color=(0, 0, 0, 0),
                        overlay_color=(0, 0, 0, .6))
         box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
         paint(box, SURF, dp(18))
         box.add_widget(Label(text="Settings", bold=True, font_size=sp(20), color=TEXT,
                              size_hint_y=None, height=dp(36)))
-        key = field("Anthropic API key (sirf is phone mein)", s["key"], True)
+        key = field("Gemini API key (aistudio.google.com/apikey)", s["gkey"], True)
         name = field("Aapka naam", s["name"])
         tg = RBtn(text="", size_hint_y=None, height=dp(46))
 
@@ -468,6 +463,13 @@ class AI(App):
             lab(); self.save()
         tg.bind(on_press=flip)
         lab()
+        mdl = RBtn(text="Model: " + (s.get("model") or "auto") + " (tap: dobara chuno)",
+                   size_hint_y=None, height=dp(46), font_size=sp(13))
+
+        def rm(*a):
+            s["model"] = ""
+            mdl.text = "Model: auto (agli baar chuna jayega)"; self.save()
+        mdl.bind(on_press=rm)
         clr = RBtn(text="Saari history hatao", size_hint_y=None, height=dp(46))
 
         def wipe(*a):
@@ -479,9 +481,9 @@ class AI(App):
         clr.bind(on_press=wipe)
 
         def ok(*a):
-            s["key"] = key.text.strip(); s["name"] = name.text.strip(); self.save()
+            s["gkey"] = key.text.strip(); s["name"] = name.text.strip(); self.save()
         mv.bind(on_dismiss=ok)
-        for w in (key, name, tg, clr,
+        for w in (key, name, tg, mdl, clr,
                   RBtn(text="Key hatao", size_hint_y=None, height=dp(46),
                        on_press=lambda *a: setattr(key, "text", "")),
                   Widget(),
@@ -672,21 +674,19 @@ class AI(App):
         if len(self.pending) >= 3:
             self.note("3 se zyada file nahi jud sakti."); return
         if mime in IMG_TYPES:
-            if mb > 3.5:
-                self.note("%s badi hai (%.1f MB). 3.5 MB tak chalti hai." % (name, mb)); return
-            blk = {"type": "image", "source": {"type": "base64", "media_type": mime,
-                                               "data": base64.b64encode(data).decode()}}
+            if mb > 7:
+                self.note("%s badi hai (%.1f MB). 7 MB tak chalti hai." % (name, mb)); return
+            blk = {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
         elif mime == "application/pdf":
-            if mb > 15:
-                self.note("PDF 15 MB tak chalti hai."); return
-            blk = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
-                                                  "data": base64.b64encode(data).decode()}}
+            if mb > 10:
+                self.note("PDF 10 MB tak chalti hai."); return
+            blk = {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
         else:
             try:
                 txt = data.decode("utf-8")
             except Exception:
                 self.note("%s ka type support nahi. Image, PDF ya text/CSV chuno." % name); return
-            blk = {"type": "text", "text": "File: " + name + "\n\n" + txt[:60000]}
+            blk = {"text": "File: " + name + "\n\n" + txt[:60000]}
         self.pending.append((name, blk))
         Clock.schedule_once(lambda dt: self.set_fl())
 
@@ -700,8 +700,10 @@ class AI(App):
         if not q and not self.pending:
             return
         s = self.db["set"]
-        if not s["key"]:
-            self.note("Pehle Menu > Settings mein API key daalo."); return
+        if not s["gkey"]:
+            self.note("Pehle Gemini API key daalo.")
+            self.open_set()
+            return
         c = self.chat()
         if not c:
             c = {"id": str(time.time()), "title": (q or "File")[:36], "ts": time.time(), "msgs": []}
@@ -728,36 +730,56 @@ class AI(App):
         self.speak_reply = voice or bool(s.get("speak"))
         threading.Thread(target=self.ask, args=(voice, blocks), daemon=True).start()
 
+    def call(self, contents, system, web):
+        s = self.db["set"]
+        body = {"system_instruction": {"parts": [{"text": system}]}, "contents": contents,
+                "generationConfig": {"maxOutputTokens": 3000}}
+        if web:
+            body["tools"] = [{"google_search": {}}]
+        r = requests.post(BASE + "/" + s["model"] + ":generateContent", json=body, timeout=120,
+                          headers={"x-goog-api-key": s["gkey"], "content-type": "application/json"})
+        return r.json()
+
     def ask(self, voice, blocks):
         out, err = "", None
         try:
+            s = self.db["set"]
             c = self.chat()
-            msgs = [{"role": m["r"], "content": m["c"]} for m in c["msgs"]]
-            q = msgs[-1]["content"]
-            if WEB and len(q.split()) >= 3:
-                self.note("(internet par dhoondh raha hai...)")
-                try:
-                    res = web_search(q)
-                except Exception:
-                    res = ""
-                if res:
-                    msgs[-1]["content"] = ("Internet search results:\n" + res +
-                                           "\n\nIn results se jawab do aur source links batao.\n\nSawal: " + q)
+            contents = [{"role": "user" if m["r"] == "user" else "model",
+                         "parts": [{"text": m["c"]}]} for m in c["msgs"]]
             if blocks:
-                msgs[-1]["content"] = blocks + [{"type": "text", "text": msgs[-1]["content"]}]
-            n = self.db["set"].get("name")
+                contents[-1]["parts"] = blocks + contents[-1]["parts"]
+            n = s.get("name")
             system = SYSTEM + (" User ka naam " + n + " hai." if n else "") + (VOICE_NOTE if voice else "")
-            body = {"model": MODEL, "max_tokens": 3000, "system": system, "messages": msgs}
-            if not WEB:
-                body["tools"] = TOOLS
-            r = requests.post(URL, timeout=120, json=body, headers={
-                "x-api-key": self.db["set"]["key"], "anthropic-version": "2023-06-01",
-                "content-type": "application/json"})
-            d = r.json()
-            if "content" not in d:
-                err = d.get("error", {}).get("message", str(d))
+            if not s.get("model"):
+                s["model"] = pick_model(s["gkey"])
+                self.save()
+            d = self.call(contents, system, WEB)
+            if "error" in d and d["error"].get("code") == 404:
+                s["model"] = pick_model(s["gkey"])
+                self.save()
+                d = self.call(contents, system, WEB)
+            if "error" in d and WEB:
+                d = self.call(contents, system, False)
+            if "error" in d:
+                err = d["error"].get("message", str(d))
+                if d["error"].get("code") == 429:
+                    err = "Free limit abhi khatam hai, thodi der baad try karo. (" + err[:80] + ")"
             else:
-                out = "".join(b.get("text", "") for b in d["content"] if b.get("type") == "text")
+                cand = (d.get("candidates") or [{}])[0]
+                out = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", [])
+                              if not p.get("thought")).strip()
+                if not out:
+                    why = cand.get("finishReason") or d.get("promptFeedback", {}).get("blockReason")
+                    err = "Jawab nahi aaya (%s)" % (why or "pata nahi")
+                else:
+                    srcs = []
+                    for g in cand.get("groundingMetadata", {}).get("groundingChunks", [])[:4]:
+                        w = g.get("web", {})
+                        if w.get("uri"):
+                            srcs.append("- " + (w.get("title") or "link") + ": " + w["uri"])
+                    if srcs:
+                        out += "\n\nSources:\n" + "\n".join(srcs)
         except Exception as e:
             err = str(e)
         Clock.schedule_once(lambda dt: self.done(out.strip(), err))
