@@ -1,9 +1,13 @@
 import os, re, json, time, base64, threading, requests
 from datetime import date
+from html import unescape
+from urllib.parse import unquote
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
-from kivy.graphics import Color, RoundedRectangle, Rectangle
+from kivy.graphics import Color, RoundedRectangle, Rectangle, Ellipse
+from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
@@ -71,30 +75,63 @@ if platform == "android":
 else:
     def run_on_ui_thread(f): return f
 
-BG = (.043, .051, .071, 1); SURF = (.07, .082, .11, 1); CARD = (.11, .125, .165, 1)
-BLUE = (.23, .51, .96, 1); TEXT = (.91, .92, .95, 1); MUTE = (.55, .58, .65, 1)
+BG = (.03, .045, .11, 1); SURF = (.055, .08, .17, 1); CARD = (.09, .125, .26, 1)
+BLUE = (.18, .45, 1, 1); TEXT = (.92, .94, .98, 1); MUTE = (.56, .63, .82, 1)
 URL = "https://api.anthropic.com/v1/messages"
 MODEL = "claude-sonnet-5-5"
 SPEECH_LANG = "hi-IN"
 TTS_LANG = ("en", "IN")
+WEB = True   # internet search band karna ho to False kar do
 SYSTEM = ("Tum 'Namaste ToonSlee AI' ho, ek expert assistant. Jawab hamesha Roman script "
           "(English letters) mein Roman Urdu/Hindi mein do, kabhi Devanagari ya Urdu script nahi, "
           "kyunke app ka font unhe dikha nahi sakta. Agar sawal Devanagari ya Urdu script mein aaye "
-          "(voice se), to pehli line 'Aapne kaha: ...' Roman mein likho, phir jawab do. Latest "
-          "jankari ke liye web_search use karo. Files aur images ko dhyan se analyze karo.")
+          "(voice se), to pehli line 'Aapne kaha: ...' Roman mein likho, phir jawab do. Agar "
+          "message ke saath internet search results diye hon, to unse jawab do aur source links batao. "
+          "Files aur images ko dhyan se analyze karo.")
 VOICE_NOTE = " Ye voice baat-cheet hai: jawab chhota rakho (2 se 4 vakya), bina list ya symbols ke."
 TOOLS = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
 IMG_TYPES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+CHIPS = [("Code", "Mujhe ek chhota Python code likh kar samjhao."),
+         ("Research", "Aaj ki sabse badi khabrein search karke batao."),
+         ("Likho", "Meri ek professional email likhne mein madad karo."),
+         ("Samjhao", "Mujhe kisi mushkil topic ko aasan zaban mein samjhao.")]
 ERR = {1: "Net slow hai", 2: "Net ki dikkat", 3: "Mic ki dikkat", 4: "Server ki dikkat",
        5: "Voice start nahi hui", 8: "Voice busy hai", 9: "Mic ki permission nahi mili",
        10: "Bahut zyada request", 11: "Server disconnect", 12: "Language support nahi",
        13: "Language ka data nahi hai"}
 
 
-def paint(w, col):
+def web_search(q, n=5):
+    r = requests.post("https://html.duckduckgo.com/html/", data={"q": q}, timeout=15,
+                      headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"})
+    clean = lambda s: unescape(re.sub(r"<[^>]+>", "", s)).strip()
+    out = []
+    for m in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+                         r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.S):
+        link, title, snip = m.groups()
+        if "uddg=" in link:
+            link = unquote(link.split("uddg=")[1].split("&")[0])
+        out.append("%d. %s\n%s\n%s" % (len(out) + 1, clean(title), clean(snip), link))
+        if len(out) >= n:
+            break
+    return "\n\n".join(out)
+
+
+def gtex(top, bot, n=64):
+    t = Texture.create(size=(1, n), colorfmt="rgb")
+    buf = bytearray()
+    for i in range(n):
+        f = min(1.0, i / (n * 0.7))
+        buf += bytes(int(bot[k] * 255 * (1 - f) + top[k] * 255 * f) for k in range(3))
+    t.blit_buffer(bytes(buf), colorfmt="rgb", bufferfmt="ubyte")
+    t.mag_filter = "linear"
+    return t
+
+
+def paint(w, col, rad=0):
     with w.canvas.before:
         Color(*col)
-        r = Rectangle(pos=w.pos, size=w.size)
+        r = RoundedRectangle(pos=w.pos, size=w.size, radius=[rad]) if rad else Rectangle(pos=w.pos, size=w.size)
     w.bind(pos=lambda *a: setattr(r, "pos", w.pos), size=lambda *a: setattr(r, "size", w.size))
 
 
@@ -106,67 +143,117 @@ def field(hint, val="", pw=False, h=46):
 
 
 class RBtn(Button):
-    def __init__(self, bg=CARD, **kw):
+    def __init__(self, bg=CARD, rad=14, **kw):
         super().__init__(background_normal="", background_down="", background_color=(0, 0, 0, 0),
                          color=TEXT, **kw)
-        self.bg = bg
+        self.bg, self.rad = bg, rad
         self.bind(pos=self.draw, size=self.draw)
 
     def draw(self, *a):
         self.canvas.before.clear()
         with self.canvas.before:
             Color(*self.bg)
-            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(14)])
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(self.rad)])
+
+
+class CBtn(Button):
+    def __init__(self, **kw):
+        super().__init__(background_normal="", background_down="", background_color=(0, 0, 0, 0),
+                         color=(1, 1, 1, 1), bold=True, **kw)
+        self.bind(pos=self.draw, size=self.draw)
+
+    def draw(self, *a):
+        self.canvas.before.clear()
+        d = min(self.size)
+        with self.canvas.before:
+            Color(*BLUE)
+            Ellipse(pos=(self.center_x - d / 2, self.center_y - d / 2), size=(d, d))
+
+
+class Orb(Widget):
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.bind(pos=self.d, size=self.d)
+
+    def d(self, *a):
+        self.canvas.clear()
+        cx, cy = self.center
+        r = min(self.size) / 2
+        with self.canvas:
+            for s, col in ((1.0, (.1, .3, .9, .12)), (.82, (.1, .35, .95, .25)),
+                           (.64, (.12, .42, 1, .95)), (.5, (.28, .62, 1, 1))):
+                Color(*col)
+                Ellipse(pos=(cx - r * s, cy - r * s), size=(r * s * 2, r * s * 2))
+            Color(.75, .9, 1, .5)
+            Ellipse(pos=(cx - r * .3, cy + r * .02), size=(r * .55, r * .3))
 
 
 class Bub(Label):
     def __init__(self, mine, **kw):
-        super().__init__(size_hint=(.85, None), height=dp(44), halign="left", valign="middle",
-                         padding=(dp(12), dp(10)), font_size=sp(16),
-                         color=(1, 1, 1, 1) if mine else TEXT, **kw)
+        super().__init__(size_hint=(.82 if mine else 1, None), height=dp(44), halign="left",
+                         valign="middle", padding=(dp(14) if mine else dp(4), dp(10)),
+                         font_size=sp(16), color=TEXT, **kw)
         self.mine = mine
         self.bind(width=self.tw, texture_size=self.th, pos=self.bg, size=self.bg)
 
-    def tw(self, *a): self.text_size = (self.width - dp(24), None)
+    def tw(self, *a): self.text_size = (self.width - dp(28 if self.mine else 8), None)
     def th(self, *a): self.height = self.texture_size[1] + dp(20)
 
     def bg(self, *a):
         self.canvas.before.clear()
-        with self.canvas.before:
-            Color(*(BLUE if self.mine else CARD))
-            RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(16)])
+        if self.mine:
+            with self.canvas.before:
+                Color(*CARD)
+                RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(18)])
 
 
 class AI(App):
     def build(self):
         Window.clearcolor = BG
+        Window.softinput_mode = "below_target"
         self.db = {"chats": [], "cur": None, "set": {"key": "", "name": "", "speak": False}}
         self.load()
         self.pending = []; self.busy = False; self.listening = False; self.handsfree = False
         self.speak_reply = False; self.misses = 0; self.poll_n = 0; self.pend_b = None
+        self.act_row = None
         self.sr = self.listener = self.tts = self.init_l = None; self.tts_ok = False
         self.hf_btn = RBtn(text="Auto-sunna: OFF", size_hint_y=None, height=dp(48),
                            on_press=self.toggle_hf)
         root = BoxLayout(orientation="vertical")
-        top = BoxLayout(size_hint_y=None, height=dp(56), padding=dp(8), spacing=dp(8))
-        paint(top, SURF)
-        top.add_widget(RBtn(text="Menu", size_hint_x=None, width=dp(72), on_press=self.open_side))
+        tex = gtex((.03, .045, .11), (.06, .22, .65))
+        with root.canvas.before:
+            Color(1, 1, 1, 1)
+            bgr = Rectangle(texture=tex, pos=root.pos, size=root.size)
+        root.bind(pos=lambda *a: setattr(bgr, "pos", root.pos),
+                  size=lambda *a: setattr(bgr, "size", root.size))
+        top = BoxLayout(size_hint_y=None, height=dp(60), padding=dp(10), spacing=dp(8))
+        top.add_widget(RBtn(text="Menu", size_hint_x=None, width=dp(76), on_press=self.open_side))
         top.add_widget(Label(text="Namaste ToonSlee AI", bold=True, font_size=sp(18), color=TEXT))
-        top.add_widget(RBtn(text="Naya", bg=BLUE, size_hint_x=None, width=dp(72), on_press=self.new_chat))
-        self.scroll = ScrollView()
-        self.box = GridLayout(cols=1, size_hint_y=None, spacing=dp(10), padding=dp(10))
+        top.add_widget(RBtn(text="Naya", size_hint_x=None, width=dp(76), on_press=self.new_chat))
+        self.scroll = ScrollView(bar_width=0)
+        self.box = GridLayout(cols=1, size_hint_y=None, spacing=dp(10), padding=dp(12))
         self.box.bind(minimum_height=self.box.setter("height"))
         self.scroll.add_widget(self.box)
         self.fl = Label(text="", size_hint_y=None, height=0, color=MUTE, font_size=sp(13))
-        bar = BoxLayout(size_hint_y=None, height=dp(64), padding=dp(8), spacing=dp(6))
-        paint(bar, SURF)
-        bar.add_widget(RBtn(text="+", size_hint_x=None, width=dp(48), on_press=self.pick_file))
-        self.inp = field("Message likho...", h=48)
+        outer = BoxLayout(size_hint_y=None, height=dp(76), padding=dp(10))
+        pill = BoxLayout(spacing=dp(4), padding=[dp(6), dp(6)])
+        paint(pill, CARD, dp(30))
+        pill.add_widget(Button(text="+", size_hint_x=None, width=dp(40), font_size=sp(24),
+                               background_normal="", background_color=(0, 0, 0, 0),
+                               on_press=self.pick_file))
+        self.inp = TextInput(hint_text="Message likho...", multiline=False, background_normal="",
+                             background_active="", background_color=(0, 0, 0, 0),
+                             foreground_color=TEXT, hint_text_color=MUTE, cursor_color=BLUE,
+                             padding=[dp(6), dp(14)], font_size=sp(16))
         self.inp.bind(on_text_validate=self.send)
-        bar.add_widget(self.inp)
-        bar.add_widget(RBtn(text="Mic", size_hint_x=None, width=dp(56), on_press=self.start_listen))
-        bar.add_widget(RBtn(text="Bhejo", bg=BLUE, size_hint_x=None, width=dp(72), on_press=self.send))
-        for w in (top, self.scroll, self.fl, bar):
+        pill.add_widget(self.inp)
+        pill.add_widget(Button(text="Mic", size_hint_x=None, width=dp(50), color=MUTE,
+                               background_normal="", background_color=(0, 0, 0, 0),
+                               on_press=self.start_listen))
+        pill.add_widget(CBtn(text="↑", font_size=sp(22), size_hint_x=None, width=dp(52),
+                             on_press=self.send))
+        outer.add_widget(pill)
+        for w in (top, self.scroll, self.fl, outer):
             root.add_widget(w)
         self.render()
         if platform == "android":
@@ -222,23 +309,77 @@ class AI(App):
         b = Bub(mine, text=text)
         row = BoxLayout(size_hint_y=None, height=b.height)
         b.bind(height=row.setter("height"))
-        gap = Widget(size_hint_x=.15)
-        for w in ((gap, b) if mine else (b, gap)):
-            row.add_widget(w)
+        if mine:
+            row.add_widget(Widget(size_hint_x=.18))
+        row.add_widget(b)
         self.box.add_widget(row)
         return b
 
+    def add_actions(self, text):
+        row = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(6))
+        for t, f in (("Copy", lambda *a: (Clipboard.copy(text), self.note("Copy ho gaya."))),
+                     ("Sunao", lambda *a: self.read_aloud(text)),
+                     ("Phir se", self.regen),
+                     ("Share", lambda *a: self.share(text))):
+            row.add_widget(RBtn(text=t, bg=SURF, rad=12, font_size=sp(13), size_hint_x=None,
+                                width=dp(74), on_press=f))
+        row.add_widget(Widget())
+        self.box.add_widget(row)
+        self.act_row = row
+
+    def read_aloud(self, text):
+        try:
+            if self.tts is not None and self.tts.isSpeaking():
+                self.tts.stop(); return
+        except Exception:
+            pass
+        self.speak(text)
+
+    def share(self, text):
+        try:
+            i = Intent(Intent.ACTION_SEND)
+            i.setType("text/plain")
+            i.putExtra(Intent.EXTRA_TEXT, text)
+            PythonActivity.mActivity.startActivity(Intent.createChooser(i, "Share"))
+        except Exception as e:
+            self.note("Share nahi hua: " + str(e))
+
+    def regen(self, *a):
+        c = self.chat()
+        if self.busy or not c or not c["msgs"] or c["msgs"][-1]["r"] != "assistant":
+            return
+        c["msgs"].pop()
+        self.save(); self.render()
+        self.pend_b = self.add_bubble("...", False)
+        self.busy = True
+        self.speak_reply = False
+        threading.Thread(target=self.ask, args=(False, []), daemon=True).start()
+
+    def home(self):
+        h = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(430), spacing=dp(14))
+        h.add_widget(Widget(size_hint_y=None, height=dp(20)))
+        h.add_widget(Orb(size_hint_y=None, height=dp(170)))
+        l = Label(text="Namaste!\nHow can I help you today?", font_size=sp(21), color=TEXT,
+                  halign="center", size_hint_y=None, height=dp(70))
+        l.bind(size=lambda *a: setattr(l, "text_size", l.size))
+        h.add_widget(l)
+        g = GridLayout(cols=2, spacing=dp(10), size_hint_y=None, height=dp(110), padding=[dp(6), 0])
+        for t, p in CHIPS:
+            g.add_widget(RBtn(text=t, bg=CARD, rad=18, on_press=lambda b, p=p: self.submit(p)))
+        h.add_widget(g)
+        return h
+
     def render(self):
         self.box.clear_widgets()
+        self.act_row = None
         c = self.chat()
         if not c or not c["msgs"]:
-            w = Label(text="Namaste!\nHow can I help you today?", font_size=sp(22), color=TEXT,
-                      size_hint_y=None, height=dp(260), halign="center")
-            w.bind(size=lambda *a: setattr(w, "text_size", w.size))
-            self.box.add_widget(w)
+            self.box.add_widget(self.home())
             return
         for m in c["msgs"]:
             self.add_bubble(m.get("s", m["c"]), m["r"] == "user", m.get("f"))
+        if c["msgs"][-1]["r"] == "assistant":
+            self.add_actions(c["msgs"][-1]["c"])
         self.down()
 
     def new_chat(self, *a):
@@ -275,8 +416,8 @@ class AI(App):
                 d = (date.today() - date.fromtimestamp(c["ts"])).days
                 g = "Aaj" if d == 0 else "Kal" if d == 1 else "Pehle"
                 if g != last:
-                    h = Label(text=g, color=MUTE, size_hint_y=None, height=dp(26), font_size=sp(13))
-                    lst.add_widget(h)
+                    lst.add_widget(Label(text=g, color=MUTE, size_hint_y=None, height=dp(26),
+                                         font_size=sp(13)))
                     last = g
                 row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
                 row.add_widget(RBtn(text=c["title"][:26], on_press=lambda b, c=c: self.open_chat(c, mv)))
@@ -313,7 +454,7 @@ class AI(App):
         mv = ModalView(size_hint=(.92, .8), background="", background_color=(0, 0, 0, 0),
                        overlay_color=(0, 0, 0, .6))
         box = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
-        paint(box, SURF)
+        paint(box, SURF, dp(18))
         box.add_widget(Label(text="Settings", bold=True, font_size=sp(20), color=TEXT,
                              size_hint_y=None, height=dp(36)))
         key = field("Anthropic API key (sirf is phone mein)", s["key"], True)
@@ -567,6 +708,9 @@ class AI(App):
             self.db["chats"].insert(0, c)
             self.db["cur"] = c["id"]
             self.box.clear_widgets()
+        if self.act_row is not None and self.act_row.parent:
+            self.box.remove_widget(self.act_row)
+        self.act_row = None
         blocks = [b for n, b in self.pending]
         names = [n for n, b in self.pending]
         self.pending = []
@@ -589,23 +733,31 @@ class AI(App):
         try:
             c = self.chat()
             msgs = [{"role": m["r"], "content": m["c"]} for m in c["msgs"]]
+            q = msgs[-1]["content"]
+            if WEB and len(q.split()) >= 3:
+                self.note("(internet par dhoondh raha hai...)")
+                try:
+                    res = web_search(q)
+                except Exception:
+                    res = ""
+                if res:
+                    msgs[-1]["content"] = ("Internet search results:\n" + res +
+                                           "\n\nIn results se jawab do aur source links batao.\n\nSawal: " + q)
             if blocks:
                 msgs[-1]["content"] = blocks + [{"type": "text", "text": msgs[-1]["content"]}]
             n = self.db["set"].get("name")
             system = SYSTEM + (" User ka naam " + n + " hai." if n else "") + (VOICE_NOTE if voice else "")
-            for _ in range(4):
-                r = requests.post(URL, timeout=120, headers={
-                    "x-api-key": self.db["set"]["key"], "anthropic-version": "2023-06-01",
-                    "content-type": "application/json"},
-                    json={"model": MODEL, "max_tokens": 3000, "system": system,
-                          "tools": TOOLS, "messages": msgs})
-                d = r.json()
-                if "content" not in d:
-                    err = d.get("error", {}).get("message", str(d)); break
-                out += "".join(b.get("text", "") for b in d["content"] if b.get("type") == "text")
-                if d.get("stop_reason") == "pause_turn":
-                    msgs.append({"role": "assistant", "content": d["content"]}); continue
-                break
+            body = {"model": MODEL, "max_tokens": 3000, "system": system, "messages": msgs}
+            if not WEB:
+                body["tools"] = TOOLS
+            r = requests.post(URL, timeout=120, json=body, headers={
+                "x-api-key": self.db["set"]["key"], "anthropic-version": "2023-06-01",
+                "content-type": "application/json"})
+            d = r.json()
+            if "content" not in d:
+                err = d.get("error", {}).get("message", str(d))
+            else:
+                out = "".join(b.get("text", "") for b in d["content"] if b.get("type") == "text")
         except Exception as e:
             err = str(e)
         Clock.schedule_once(lambda dt: self.done(out.strip(), err))
@@ -625,6 +777,7 @@ class AI(App):
         c["ts"] = time.time()
         self.save()
         self.pend_b.text = out
+        self.add_actions(out)
         self.down()
         if self.speak_reply:
             self.after_answer(out)
